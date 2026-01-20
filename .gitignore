@@ -8,6 +8,7 @@ datasets*
 data/*
 !data/dataset_shuffle
 *.pt
+*.sh
 
 # Pycharm
 .idea/

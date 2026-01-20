@@ -3,15 +3,8 @@ from torch.utils.data import Dataset
 import h5py
 import numpy as np
 
-class ASCADDataset(Dataset):
+class SCADataset(Dataset):
     def __init__(self, data_path, split='train', input_length=700, desync=0):
-        """
-        Args:
-            data_path (str): Path to the ASCAD.h5 file.
-            split (str): 'train' for Profiling_traces, 'test' for Attack_traces.
-            input_length (int): Number of time samples to slice from the trace.
-            desync (int): Maximum desynchronization shift (data augmentation).
-        """
         self.data_path = data_path
         self.split = split
         self.input_length = input_length
@@ -23,87 +16,122 @@ class ASCADDataset(Dataset):
         except OSError:
             raise FileNotFoundError(f"Could not open HDF5 file at {data_path}")
 
-        # Select the correct group based on standard ASCAD structure
+        # --- 1. Robust Group Detection (AES_PT vs ASCAD) ---
+        self.group = None
+        
+        # List of possible group paths
         if split == 'train':
-            self.group_name = 'Profiling_traces'
-        elif split == 'test':
-            self.group_name = 'Attack_traces'
+            candidates = [
+                'Profiling_traces',           # ASCAD
+                'D1/Unprotected/Profiling',   # AES_PT
+                'D1/AES_unprotected/Profiling', 
+                'Profiling'
+            ]
         else:
-            raise ValueError("Split must be 'train' or 'test'")
+            candidates = [
+                'Attack_traces',              # ASCAD
+                'D1/Unprotected/Attack',      # AES_PT
+                'D1/AES_unprotected/Attack',
+                'Attack'
+            ]
 
-        if self.group_name not in self.h5_file:
-            raise ValueError(f"Group {self.group_name} not found in {data_path}")
-            
-        self.group = self.h5_file[self.group_name]
+        for c in candidates:
+            if c in self.h5_file:
+                self.group = self.h5_file[c]
+                break
         
-        # Verify structure
-        if 'traces' not in self.group or 'labels' not in self.group:
-             raise ValueError(f"Group {self.group_name} must contain 'traces' and 'labels'")
-
-        # Cache dataset properties
-        self.n_samples = self.group['traces'].shape[0]
-        self.full_length = self.group['traces'].shape[1]
-        
-        # Load Labels into memory (efficient as they are small integers)
-        self.labels = np.array(self.group['labels'], dtype=np.int64)
-        
-        # Load Metadata (Plaintext and Key) for evaluation
-        # ASCAD usually targets Byte 2 (Index 2). 
-        # We load specific bytes here so evaluation scripts can use them directly.
-        if 'metadata' in self.group:
-            meta = self.group['metadata']
-            # Check if metadata is structured or standard array
-            # ASCAD metadata is usually a structured array with fields 'plaintext' and 'key'
-            if 'plaintext' in meta.dtype.names and 'key' in meta.dtype.names:
-                self.plaintexts = np.array(meta['plaintext'][:, 2], dtype=np.uint8) # Extract Byte 2
-                self.keys = np.array(meta['key'][:, 2], dtype=np.uint8)             # Extract Byte 2
+        # Fallback: Check root
+        if self.group is None:
+            if 'traces' in self.h5_file or 'Traces' in self.h5_file:
+                self.group = self.h5_file
             else:
-                print("Warning: Metadata format not recognized (missing 'plaintext' or 'key' fields).")
-                self.plaintexts = None
-                self.keys = None
-        else:
-            self.plaintexts = None
-            self.keys = None
+                raise ValueError(f"Could not find valid group for split '{split}'. Keys: {list(self.h5_file.keys())}")
+
+        # --- 2. Robust Dataset Loading ---
+        def get_ds(names):
+            for name in names:
+                if name in self.group: return self.group[name]
+                for k in self.group.keys():
+                    if k.lower() == name.lower(): return self.group[k]
+            return None
+
+        self.traces = get_ds(['traces', 'trace'])
+        self.labels = get_ds(['labels', 'label', 'Y', 'output'])
+        metadata_ds = get_ds(['metadata', 'meta', 'metadata_set'])
+
+        if self.traces is None or self.labels is None:
+            raise ValueError(f"Could not find traces/labels in {self.group.name}")
+
+        self.full_length = self.traces.shape[1]
+
+        # --- 3. Pre-load Metadata (For Rank Calculation) ---
+        self.plaintexts = None
+        self.keys = None
+        
+        # Determine Target Byte (AES_PT=0, ASCAD=2)
+        is_aes_pt = 'AES_PT' in data_path or 'D1' in self.group.name
+        target_byte = 0 if is_aes_pt else 2
+
+        if metadata_ds is not None:
+            dtype_names = metadata_ds.dtype.names if metadata_ds.dtype.names else []
+            pt_field = next((n for n in dtype_names if n.lower() in ['plaintext', 'pt', 'p', 'input']), None)
+            key_field = next((n for n in dtype_names if n.lower() in ['key', 'k', 'key_input']), None)
+            
+            if pt_field and key_field:
+                raw_pt = metadata_ds[pt_field]
+                raw_key = metadata_ds[key_field]
+                
+                # Extract target byte if array, otherwise take as is
+                if len(raw_pt.shape) > 1 and raw_pt.shape[1] >= 16:
+                    self.plaintexts = raw_pt[:, target_byte]
+                else:
+                    self.plaintexts = raw_pt
+
+                if len(raw_key.shape) > 1 and raw_key.shape[1] >= 16:
+                    self.keys = raw_key[:, target_byte]
+                else:
+                    self.keys = raw_key
 
     def __len__(self):
-        return self.n_samples
+        return len(self.traces)
 
     def __getitem__(self, idx):
-        # 1. Read Trace
-        # We access the disk here. For high performance on small systems, 
-        # one might load everything to RAM, but ASCAD traces are large.
-        trace = self.group['traces'][idx]
-        trace = np.array(trace, dtype=np.float32)
+        # 1. Load Trace
+        trace_numpy = self.traces[idx]
         
-        # 2. Data Augmentation (Desynchronization)
-        # Randomly shift the window if we are training and desync is enabled
-        if self.desync > 0 and self.split == 'train':
-            shift = np.random.randint(-self.desync, self.desync + 1)
-            if shift != 0:
-                # We roll the array to simulate timing jitter
-                # Note: Real desync might lose data at edges, but rolling is standard 
-                # if the signal of interest is centered.
-                trace = np.roll(trace, shift)
+        # Crop
+        if self.input_length < len(trace_numpy):
+            trace_numpy = trace_numpy[:self.input_length]
+        
+        # 2. Augmentation
+        if self.split == 'train':
+            if self.desync > 0:
+                shift = np.random.randint(-self.desync, self.desync + 1)
+                if shift > 0:
+                    trace_numpy = np.pad(trace_numpy, (shift, 0), 'constant')[:-shift]
+                elif shift < 0:
+                    trace_numpy = np.pad(trace_numpy, (0, -shift), 'constant')[-shift:]
+            
+            noise = np.random.normal(0, 0.1, trace_numpy.shape)
+            trace_numpy = trace_numpy + noise
 
-        # 3. Cropping / Slicing to input_length
-        # If the requested length is smaller than the full trace, we slice.
-        if self.input_length < self.full_length:
-            trace = trace[:self.input_length]
-        elif self.input_length > self.full_length:
-             # Pad with zeros if requested length is larger
-             padding = self.input_length - self.full_length
-             trace = np.pad(trace, (0, padding), 'constant')
+        # 3. Normalize
+        mean = np.mean(trace_numpy)
+        std = np.std(trace_numpy)
+        trace_numpy = (trace_numpy - mean) / (std + 1e-12)
 
-        # 4. Convert to Tensor
-        trace_tensor = torch.from_numpy(trace)
+        # 4. Return Tensors
+        # CHANGED: Removed .unsqueeze(0). 
+        # Output shape is now [Length], which DataLoader batches to [Batch, Length].
+        # Your model.py then does .unsqueeze(1) to make it [Batch, 1, Length], which is correct.
+        trace_tensor = torch.from_numpy(trace_numpy).float()
         label_tensor = torch.tensor(self.labels[idx], dtype=torch.long)
         
         return trace_tensor, label_tensor
 
     def close(self):
-        """Close the HDF5 file handle."""
-        if self.h5_file:
+        if hasattr(self, 'h5_file') and self.h5_file:
             self.h5_file.close()
 
-    def __del__(self):
-        self.close()
+# Alias
+ASCADDataset = SCADataset
