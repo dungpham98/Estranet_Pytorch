@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 # Import your custom modules
 from model import Transformer
 import utils
-from dataset import SCADataset
+from dataset import ASCADDataset
 
 def get_args():
     parser = argparse.ArgumentParser(description="Side Channel Analysis Transformer")
@@ -282,7 +282,7 @@ def main():
     # --- Dataset Loading ---
     if args.dataset == 'ASCAD':
         if args.do_train:
-            train_ds = SCADataset(
+            train_ds = ASCADDataset(
                 data_path=args.data_path, 
                 split='train', 
                 input_length=args.input_length, 
@@ -299,7 +299,7 @@ def main():
         else:
             train_loader = None
 
-        test_ds = SCADataset(
+        test_ds = ASCADDataset(
             data_path=args.data_path, 
             split='test', 
             input_length=args.input_length, 
